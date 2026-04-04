@@ -221,14 +221,19 @@ async function resolveMessageSchema() {
     );
 
     const columns = new Set(rows.map((row) => row.COLUMN_NAME));
+    const senderColumn = columns.has('sender_id') ? 'sender_id' : (columns.has('sender') ? 'sender' : null);
     const textColumn = columns.has('text') ? 'text' : (columns.has('message') ? 'message' : null);
     const timestampColumn = columns.has('sent_at') ? 'sent_at' : (columns.has('created_at') ? 'created_at' : null);
+
+    if (!senderColumn) {
+        throw new Error('messages table is missing a sender/sender_id column');
+    }
 
     if (!textColumn) {
         throw new Error('messages table is missing a text/message column');
     }
 
-    messageSchemaCache = { textColumn, timestampColumn };
+    messageSchemaCache = { senderColumn, textColumn, timestampColumn };
     return messageSchemaCache;
 }
 
@@ -390,10 +395,10 @@ app.post('/messages', requireAuth, async (req, res) => {
     }
 
     try {
-        const { textColumn } = await resolveMessageSchema();
+        const { senderColumn, textColumn } = await resolveMessageSchema();
         const [result] = await dbPromise.query(
-            `INSERT INTO messages (sender_id, ${textColumn}) VALUES (?, ?)`,
-            [sender_id, String(text).trim()]
+            `INSERT INTO messages (${senderColumn}, ${textColumn}) VALUES (?, ?)`,
+            [String(sender_id), String(text).trim()]
         );
 
         res.json({
@@ -414,12 +419,15 @@ app.post('/messages', requireAuth, async (req, res) => {
 // GET /messages - Fetch all chat history
 app.get('/messages', requireAuth, async (req, res) => {
     try {
-        const { textColumn, timestampColumn } = await resolveMessageSchema();
+        const { senderColumn, textColumn, timestampColumn } = await resolveMessageSchema();
         const orderColumn = timestampColumn || 'id';
         const selectTimestamp = timestampColumn ? `${timestampColumn} AS sent_at` : 'NOW() AS sent_at';
+        const selectSender = senderColumn === 'sender_id'
+            ? 'sender_id'
+            : `CAST(${senderColumn} AS UNSIGNED) AS sender_id`;
 
         const [results] = await dbPromise.query(
-            `SELECT id, sender_id, ${textColumn} AS text, ${selectTimestamp}
+            `SELECT id, ${selectSender}, ${textColumn} AS text, ${selectTimestamp}
              FROM messages
              ORDER BY ${orderColumn} ASC`
         );

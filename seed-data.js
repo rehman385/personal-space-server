@@ -1,51 +1,48 @@
 require('dotenv').config();
-const mysql = require('mysql2');
+const mysql = require('mysql2/promise');
 
-// Connect using the secrets from your .env file
-const db = mysql.createConnection({
+(async () => {
+  const db = await mysql.createConnection({
     host: process.env.DB_HOST,
     user: process.env.DB_USER,
     password: process.env.DB_PASSWORD,
-    database: process.env.DB_NAME
-});
+    database: process.env.DB_NAME,
+    ssl: process.env.DB_SSL_ENABLED === 'true' ? { rejectUnauthorized: false } : undefined,
+  });
 
-db.connect((err) => {
-    if (err) {
-        console.error('❌ Connection error:', err.message);
-        return;
-    }
+  try {
     console.log('✅ Connected to database. Adding test data...');
 
-    // Insert test users (if they don't already exist)
-    const insertUsers = `
-        INSERT IGNORE INTO users (id, name, pin_code) VALUES
-        (1, 'Shafique', '1234'),
-        (2, 'Maria', '5678')
-    `;
+    await db.query(`
+      INSERT IGNORE INTO users (id, name, pin_code) VALUES
+      (1, 'Shafique', '1234'),
+      (2, 'Maria', '5678'),
+      (30001, 'Mishamina', '4321')
+    `);
+    console.log('✅ Test users added/verified.');
 
-    db.query(insertUsers, (err) => {
-        if (err) {
-            console.error('Error inserting users:', err);
-        } else {
-            console.log('✅ Test users added/verified.');
-        }
+    const [messageColumns] = await db.query(
+      `SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'messages'`
+    );
+    const columns = new Set(messageColumns.map((row) => row.COLUMN_NAME));
+    const senderColumn = columns.has('sender_id') ? 'sender_id' : (columns.has('sender') ? 'sender' : null);
+    const textColumn = columns.has('text') ? 'text' : (columns.has('message') ? 'message' : null);
 
-        // Insert a sample message
-        const insertMessage = `
-            INSERT INTO messages (sender_id, text) VALUES
-            (2, 'Hi Shafique! I miss you ❤️')
-        `;
+    if (!senderColumn || !textColumn) {
+      throw new Error('messages table is missing the expected sender/text columns');
+    }
 
-        db.query(insertMessage, (err) => {
-            if (err) {
-                console.error('Error inserting message:', err);
-            } else {
-                console.log('✅ Sample message added.');
-            }
-            
-            console.log('🎉 Database seeded successfully! Exiting...');
-            db.end();
-            process.exit();
-        });
-    });
-});
+    await db.query(
+      `INSERT INTO messages (${senderColumn}, ${textColumn}) VALUES (?, ?)`,
+      ['2', 'Hi Shafique! I miss you ❤️']
+    );
+    console.log('✅ Sample message added.');
+
+    console.log('🎉 Database seeded successfully! Exiting...');
+  } catch (error) {
+    console.error('Error seeding database:', error);
+    process.exitCode = 1;
+  } finally {
+    await db.end();
+  }
+})();
