@@ -9,6 +9,7 @@ const bcrypt = require('bcryptjs');
 const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
+const tls = require('tls');
 const axios = require('axios');
 
 const app = express();
@@ -144,7 +145,8 @@ function buildSslConfig() {
     }
 
     return {
-        ca,
+        // Keep Node's default trusted roots and add TiDB CA to avoid issuer-chain failures.
+        ca: [ca, ...tls.rootCertificates],
         minVersion: 'TLSv1.2',
         rejectUnauthorized: process.env.DB_SSL_REJECT_UNAUTHORIZED !== 'false'
     };
