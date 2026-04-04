@@ -206,6 +206,32 @@ function startInternalHeartbeat() {
     console.log(`❤️ Internal heartbeat enabled for ${pingUrl} (every ${HEARTBEAT_INTERVAL_MS / 60000} minutes).`);
 }
 
+let messageSchemaCache = null;
+
+async function resolveMessageSchema() {
+    if (messageSchemaCache) {
+        return messageSchemaCache;
+    }
+
+    const [rows] = await dbPromise.query(
+        `SELECT COLUMN_NAME
+         FROM INFORMATION_SCHEMA.COLUMNS
+         WHERE TABLE_SCHEMA = DATABASE()
+           AND TABLE_NAME = 'messages'`
+    );
+
+    const columns = new Set(rows.map((row) => row.COLUMN_NAME));
+    const textColumn = columns.has('text') ? 'text' : (columns.has('message') ? 'message' : null);
+    const timestampColumn = columns.has('sent_at') ? 'sent_at' : (columns.has('created_at') ? 'created_at' : null);
+
+    if (!textColumn) {
+        throw new Error('messages table is missing a text/message column');
+    }
+
+    messageSchemaCache = { textColumn, timestampColumn };
+    return messageSchemaCache;
+}
+
 // ==================== AUTHENTICATION ====================
 
 // POST /login - Verify PIN and return user data
@@ -355,7 +381,7 @@ app.get('/users/profiles', requireAuth, (_, res) => {
 // ==================== CHAT MESSAGES ====================
 
 // POST /messages - Save a message to the database
-app.post('/messages', requireAuth, (req, res) => {
+app.post('/messages', requireAuth, async (req, res) => {
     const { text } = req.body;
     const sender_id = req.user.userId;
 
@@ -363,38 +389,46 @@ app.post('/messages', requireAuth, (req, res) => {
         return res.status(400).json({ success: false, message: 'text is required' });
     }
 
-    db.query(
-        'INSERT INTO messages (sender_id, text) VALUES (?, ?)',
-        [sender_id, String(text).trim()],
-        (err, result) => {
-            if (err) {
-                console.error('Database error:', err);
-                return res.status(500).json({ success: false, message: 'Failed to save message' });
-            }
+    try {
+        const { textColumn } = await resolveMessageSchema();
+        const [result] = await dbPromise.query(
+            `INSERT INTO messages (sender_id, ${textColumn}) VALUES (?, ?)`,
+            [sender_id, String(text).trim()]
+        );
 
-            res.json({
-                success: true,
-                message: {
-                    id: result.insertId,
-                    sender_id,
-                    text,
-                    sent_at: new Date()
-                }
-            });
-        }
-    );
+        res.json({
+            success: true,
+            message: {
+                id: result.insertId,
+                sender_id,
+                text: String(text).trim(),
+                sent_at: new Date()
+            }
+        });
+    } catch (err) {
+        console.error('Database error:', err);
+        return res.status(500).json({ success: false, message: 'Failed to save message' });
+    }
 });
 
 // GET /messages - Fetch all chat history
-app.get('/messages', requireAuth, (req, res) => {
-    db.query('SELECT * FROM messages ORDER BY sent_at ASC', (err, results) => {
-        if (err) {
-            console.error('Database error:', err);
-            return res.status(500).json({ success: false, message: 'Failed to fetch messages' });
-        }
+app.get('/messages', requireAuth, async (req, res) => {
+    try {
+        const { textColumn, timestampColumn } = await resolveMessageSchema();
+        const orderColumn = timestampColumn || 'id';
+        const selectTimestamp = timestampColumn ? `${timestampColumn} AS sent_at` : 'NOW() AS sent_at';
+
+        const [results] = await dbPromise.query(
+            `SELECT id, sender_id, ${textColumn} AS text, ${selectTimestamp}
+             FROM messages
+             ORDER BY ${orderColumn} ASC`
+        );
 
         res.json({ success: true, messages: results });
-    });
+    } catch (err) {
+        console.error('Database error:', err);
+        return res.status(500).json({ success: false, message: 'Failed to fetch messages' });
+    }
 });
 
 // ==================== VAULT (FILE UPLOADS) ====================
