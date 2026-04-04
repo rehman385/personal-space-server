@@ -114,18 +114,33 @@ function buildSslConfig() {
         return undefined;
     }
 
-    const caPath = process.env.DB_SSL_CA_PATH || '/etc/secrets/ca.pem';
-    const caInline = process.env.DB_SSL_CA;
+    const renderCaPath = '/etc/secrets/ca.pem';
+    const localCaPaths = [
+        process.env.DB_SSL_CA_PATH_LOCAL,
+        process.env.DB_SSL_CA_PATH,
+        path.join(__dirname, 'ca.pem'),
+        path.join(process.cwd(), 'ca.pem')
+    ].filter(Boolean);
+
     let ca = null;
 
-    if (caInline && String(caInline).trim()) {
-        ca = caInline;
-    } else if (fs.existsSync(caPath)) {
-        ca = fs.readFileSync(caPath, 'utf8');
+    if (fs.existsSync(renderCaPath)) {
+        ca = fs.readFileSync(renderCaPath, 'utf8');
+    } else {
+        for (const candidatePath of localCaPaths) {
+            if (candidatePath && fs.existsSync(candidatePath)) {
+                ca = fs.readFileSync(candidatePath, 'utf8');
+                break;
+            }
+        }
+    }
+
+    if (!ca && process.env.DB_SSL_CA && String(process.env.DB_SSL_CA).trim()) {
+        ca = process.env.DB_SSL_CA;
     }
 
     if (!ca) {
-        throw new Error('SSL is enabled but no CA was found. Set DB_SSL_CA or mount DB_SSL_CA_PATH.');
+        throw new Error('SSL is enabled but no CA was found. Render expects /etc/secrets/ca.pem; for local runs set DB_SSL_CA_PATH_LOCAL or place ca.pem in the server folder.');
     }
 
     return {
