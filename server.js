@@ -226,7 +226,16 @@ async function initializeDatabase() {
     console.log('✅ Successfully connected to TiDB/MySQL using pooled connections.');
 
     for (const statement of startupMigrations) {
-        await dbPromise.query(statement);
+        try {
+            await dbPromise.query(statement);
+        } catch (error) {
+            const isAlterStatement = /^\s*ALTER\s+TABLE/i.test(statement);
+            if (isAlterStatement) {
+                console.warn(`⚠️ Skipping non-critical schema normalization: ${error.message}`);
+                continue;
+            }
+            throw error;
+        }
     }
 
     console.log('✅ Startup schema migrations completed (utf8mb4 + BIGINT checks).');
