@@ -169,76 +169,9 @@ const db = mysql.createPool({
 
 const dbPromise = db.promise();
 
-const startupMigrations = [
-    `CREATE TABLE IF NOT EXISTS users (
-        id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
-        name VARCHAR(50) NOT NULL,
-        pin_code VARCHAR(255) NOT NULL,
-        profile_pic VARCHAR(255) DEFAULT NULL,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci`,
-    `CREATE TABLE IF NOT EXISTS messages (
-        id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
-        sender_id BIGINT UNSIGNED NOT NULL,
-        text TEXT NOT NULL,
-        sent_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci`,
-    `CREATE TABLE IF NOT EXISTS vault_items (
-        id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
-        user_id BIGINT UNSIGNED NOT NULL,
-        media_type ENUM('image', 'video') NOT NULL,
-        file_path VARCHAR(255) NOT NULL,
-        caption VARCHAR(255) DEFAULT '',
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci`,
-    `CREATE TABLE IF NOT EXISTS special_dates (
-        id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
-        user_id BIGINT UNSIGNED NOT NULL,
-        title VARCHAR(120) NOT NULL,
-        event_date DATE NOT NULL,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci`,
-    `CREATE TABLE IF NOT EXISTS nudges (
-        id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
-        sender_id BIGINT UNSIGNED NOT NULL,
-        text TEXT NOT NULL,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci`,
-    'ALTER TABLE users ADD COLUMN IF NOT EXISTS profile_pic VARCHAR(255) DEFAULT NULL',
-    'ALTER TABLE users MODIFY COLUMN id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT',
-    'ALTER TABLE users CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci',
-    'ALTER TABLE messages MODIFY COLUMN id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT',
-    'ALTER TABLE messages MODIFY COLUMN sender_id BIGINT UNSIGNED NOT NULL',
-    'ALTER TABLE messages CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci',
-    'ALTER TABLE vault_items MODIFY COLUMN id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT',
-    'ALTER TABLE vault_items MODIFY COLUMN user_id BIGINT UNSIGNED NOT NULL',
-    'ALTER TABLE vault_items CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci',
-    'ALTER TABLE special_dates MODIFY COLUMN id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT',
-    'ALTER TABLE special_dates MODIFY COLUMN user_id BIGINT UNSIGNED NOT NULL',
-    'ALTER TABLE special_dates CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci',
-    'ALTER TABLE nudges MODIFY COLUMN id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT',
-    'ALTER TABLE nudges MODIFY COLUMN sender_id BIGINT UNSIGNED NOT NULL',
-    'ALTER TABLE nudges CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci'
-];
-
 async function initializeDatabase() {
     await dbPromise.query('SELECT 1');
     console.log('✅ Successfully connected to TiDB/MySQL using pooled connections.');
-
-    for (const statement of startupMigrations) {
-        try {
-            await dbPromise.query(statement);
-        } catch (error) {
-            const isAlterStatement = /^\s*ALTER\s+TABLE/i.test(statement);
-            if (isAlterStatement) {
-                console.warn(`⚠️ Skipping non-critical schema normalization: ${error.message}`);
-                continue;
-            }
-            throw error;
-        }
-    }
-
-    console.log('✅ Startup schema migrations completed (utf8mb4 + BIGINT checks).');
 }
 
 async function getDbStatus() {
