@@ -188,6 +188,19 @@ async function ensurePinColumnSupportsHashes() {
     console.log(`✅ Expanded users.pin_code to VARCHAR(255) (was ${maxLen}) for hashed PIN support.`);
 }
 
+async function pinColumnSupportsHashes() {
+    const [rows] = await dbPromise.query(
+        `SELECT CHARACTER_MAXIMUM_LENGTH AS maxLen
+         FROM INFORMATION_SCHEMA.COLUMNS
+         WHERE TABLE_SCHEMA = DATABASE()
+           AND TABLE_NAME = 'users'
+           AND COLUMN_NAME = 'pin_code'`
+    );
+
+    const maxLen = Number(rows?.[0]?.maxLen || 0);
+    return Number.isFinite(maxLen) && maxLen >= 60;
+}
+
 async function initializeDatabase() {
     await dbPromise.query('SELECT 1');
     await ensurePinColumnSupportsHashes();
@@ -298,10 +311,20 @@ app.post('/login', authLimiter, (req, res) => {
             return res.status(401).json({ success: false, message: 'Invalid PIN' });
         }
 
-        // Auto-migrate plain text PIN to hashed on successful login
+        // Auto-migrate plain text PIN to hashed on successful login when column supports it.
         if (!matchedUser.pin_code.startsWith('$2')) {
-            const hashed = await bcrypt.hash(pin_code, 12);
-            db.query('UPDATE users SET pin_code = ? WHERE id = ?', [hashed, matchedUser.id]);
+            try {
+                if (await pinColumnSupportsHashes()) {
+                    const hashed = await bcrypt.hash(pin_code, 12);
+                    db.query('UPDATE users SET pin_code = ? WHERE id = ?', [hashed, matchedUser.id], (updateErr) => {
+                        if (updateErr) {
+                            console.error('PIN hash migration skipped:', updateErr.message);
+                        }
+                    });
+                }
+            } catch (migrationErr) {
+                console.error('PIN hash capability check failed:', migrationErr.message);
+            }
         }
 
         const token = createToken(matchedUser);
@@ -353,20 +376,27 @@ app.post('/change-password', requireAuth, async (req, res) => {
             return res.status(401).json({ success: false, message: 'Current password is incorrect' });
         }
 
-        const newHashed = await bcrypt.hash(new_password, 12);
+        try {
+            const canStoreHashedPin = await pinColumnSupportsHashes();
+            const valueToStore = canStoreHashedPin
+                ? await bcrypt.hash(new_password, 12)
+                : new_password;
 
-        // Update to new password
-        db.query('UPDATE users SET pin_code = ? WHERE id = ?', [newHashed, user_id], (err) => {
-            if (err) {
-                console.error('Database error:', err);
-                return res.status(500).json({ success: false, message: 'Failed to update password' });
-            }
+            db.query('UPDATE users SET pin_code = ? WHERE id = ?', [valueToStore, user_id], (err) => {
+                if (err) {
+                    console.error('Database error:', err);
+                    return res.status(500).json({ success: false, message: 'Failed to update password' });
+                }
 
-            res.json({
-                success: true,
-                message: 'PIN changed successfully! 🎉'
+                res.json({
+                    success: true,
+                    message: 'PIN changed successfully! 🎉'
+                });
             });
-        });
+        } catch (schemaErr) {
+            console.error('Password update schema check failed:', schemaErr);
+            return res.status(500).json({ success: false, message: 'Failed to update password' });
+        }
     });
 });
 
