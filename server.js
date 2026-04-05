@@ -939,14 +939,43 @@ app.post('/vault/upload', requireAuth, uploadLimiter, upload.single('media'), as
     }
 });
 
-// GET /vault - Fetch vault media history
-app.get('/vault', requireAuth, async (_, res) => {
+// GET /vault - Fetch own vault media history
+app.get('/vault', requireAuth, async (req, res) => {
+    const userId = req.user.userId;
     try {
-        const [results] = await dbPromise.query('SELECT * FROM vault_items ORDER BY created_at DESC');
+        const [results] = await dbPromise.query(
+            'SELECT * FROM vault_items WHERE user_id = ? ORDER BY created_at DESC',
+            [userId]
+        );
         return res.json({ success: true, items: results });
     } catch (err) {
         console.error('Database error:', err);
         return res.status(500).json({ success: false, message: 'Failed to fetch vault items' });
+    }
+});
+
+// DELETE /vault - Clear authenticated user's vault
+app.delete('/vault', requireAuth, async (req, res) => {
+    const userId = req.user.userId;
+    try {
+        const [rows] = await dbPromise.query(
+            'SELECT file_path FROM vault_items WHERE user_id = ?',
+            [userId]
+        );
+        const deletedCount = rows.length;
+
+        await dbPromise.query('DELETE FROM vault_items WHERE user_id = ?', [userId]);
+
+        rows.forEach((row) => {
+            const fullPath = path.join(__dirname, String(row.file_path || '').replace(/^\//, ''));
+            // Best-effort cleanup if file is already missing.
+            fs.unlink(fullPath, () => { });
+        });
+
+        return res.json({ success: true, deleted: deletedCount, message: 'Vault cleared.' });
+    } catch (err) {
+        console.error('Database error:', err);
+        return res.status(500).json({ success: false, message: 'Failed to clear vault' });
     }
 });
 
