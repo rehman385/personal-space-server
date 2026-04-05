@@ -170,8 +170,27 @@ const db = mysql.createPool({
 
 const dbPromise = db.promise();
 
+async function ensurePinColumnSupportsHashes() {
+    const [rows] = await dbPromise.query(
+        `SELECT CHARACTER_MAXIMUM_LENGTH AS maxLen
+         FROM INFORMATION_SCHEMA.COLUMNS
+         WHERE TABLE_SCHEMA = DATABASE()
+           AND TABLE_NAME = 'users'
+           AND COLUMN_NAME = 'pin_code'`
+    );
+
+    const maxLen = Number(rows?.[0]?.maxLen || 0);
+    if (!Number.isFinite(maxLen) || maxLen >= 60) {
+        return;
+    }
+
+    await dbPromise.query('ALTER TABLE users MODIFY COLUMN pin_code VARCHAR(255) NULL');
+    console.log(`✅ Expanded users.pin_code to VARCHAR(255) (was ${maxLen}) for hashed PIN support.`);
+}
+
 async function initializeDatabase() {
     await dbPromise.query('SELECT 1');
+    await ensurePinColumnSupportsHashes();
     console.log('✅ Successfully connected to TiDB/MySQL using pooled connections.');
 }
 
