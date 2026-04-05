@@ -74,6 +74,15 @@ const upload = multer({
     }
 });
 
+const voiceUpload = multer({
+    storage,
+    limits: { fileSize: 25 * 1024 * 1024 },
+    fileFilter: (_, file, cb) => {
+        const ok = file.mimetype.startsWith('audio/');
+        cb(ok ? null : new Error('Only audio files are allowed'), ok);
+    }
+});
+
 const profileStorage = multer.diskStorage({
     destination: (_, __, cb) => cb(null, profileUploadDir),
     filename: (_, file, cb) => {
@@ -724,7 +733,7 @@ app.post('/messages', requireAuth, messageLimiter, async (req, res) => {
 });
 
 // POST /messages/voice - Upload voice memo and send as [VOICE] payload message
-app.post('/messages/voice', requireAuth, messageLimiter, upload.single('audio'), async (req, res) => {
+app.post('/messages/voice', requireAuth, messageLimiter, voiceUpload.single('audio'), async (req, res) => {
     const senderId = req.user.userId;
     const replyTo = req.body.replyTo ? Number(req.body.replyTo) : null;
     
