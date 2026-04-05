@@ -577,21 +577,35 @@ app.post('/profile-pic/upload', requireAuth, uploadLimiter, upload.single('profi
 // POST /settings/personalization - Set wallpaper & nickname
 app.post('/settings/personalization', requireAuth, uploadLimiter, upload.single('chat_wallpaper'), async (req, res) => {
     const userId = req.user.userId;
-    const partnerNickname = req.body.partner_nickname || null;
-    let wallpaperPath = req.body.chat_wallpaper || null; // for resetting to default if empty
+    const hasWallpaperField = Object.prototype.hasOwnProperty.call(req.body, 'chat_wallpaper') || !!req.file;
+    const hasNicknameField = Object.prototype.hasOwnProperty.call(req.body, 'partner_nickname');
+    const partnerNickname = hasNicknameField ? (req.body.partner_nickname || null) : undefined;
+    let wallpaperPath = hasWallpaperField ? (req.body.chat_wallpaper || null) : undefined;
 
     if (req.file) {
         wallpaperPath = `/uploads/profiles/${req.file.filename}`;
     }
 
     try {
-        if (wallpaperPath !== undefined && partnerNickname !== undefined) {
-             await dbPromise.query('UPDATE users SET chat_wallpaper = ?, partner_nickname = ? WHERE id = ?', [wallpaperPath, partnerNickname, userId]);
-        } else if (wallpaperPath !== undefined) {
-             await dbPromise.query('UPDATE users SET chat_wallpaper = ? WHERE id = ?', [wallpaperPath, userId]);
-        } else if (partnerNickname !== undefined) {
-             await dbPromise.query('UPDATE users SET partner_nickname = ? WHERE id = ?', [partnerNickname, userId]);
+        const updates = [];
+        const values = [];
+
+        if (wallpaperPath !== undefined) {
+            updates.push('chat_wallpaper = ?');
+            values.push(wallpaperPath);
         }
+
+        if (partnerNickname !== undefined) {
+            updates.push('partner_nickname = ?');
+            values.push(partnerNickname);
+        }
+
+        if (!updates.length) {
+            return res.status(400).json({ success: false, message: 'No personalization data provided' });
+        }
+
+        values.push(userId);
+        await dbPromise.query(`UPDATE users SET ${updates.join(', ')} WHERE id = ?`, values);
         
         return res.json({ success: true, chat_wallpaper: wallpaperPath, partner_nickname: partnerNickname });
     } catch (err) {
