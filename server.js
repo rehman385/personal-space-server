@@ -11,8 +11,11 @@ const path = require('path');
 const fs = require('fs');
 const tls = require('tls');
 const axios = require('axios');
+const http = require('http');
+const { Server } = require('socket.io');
 
 const app = express();
+const httpServer = http.createServer(app);
 app.set('trust proxy', 1);
 const JWT_SECRET = process.env.JWT_SECRET || 'replace_this_with_a_long_secret_key';
 const RENDER_EXTERNAL_URL = process.env.RENDER_EXTERNAL_URL || null;
@@ -245,10 +248,44 @@ async function pinColumnSupportsHashes() {
     return Number.isFinite(maxLen) && maxLen >= 60;
 }
 
+async function ensureUserPresenceColumn() {
+    try {
+        await dbPromise.query('ALTER TABLE users ADD COLUMN is_online BOOLEAN DEFAULT FALSE');
+        console.log('✅ Added is_online to users');
+    } catch { }
+    try {
+        await dbPromise.query('ALTER TABLE users ADD COLUMN last_seen_at TIMESTAMP NULL');
+        console.log('✅ Added last_seen_at to users');
+    } catch { }
+}
+
+async function ensurePersonalizationColumns() {
+    try {
+        await dbPromise.query('ALTER TABLE users ADD COLUMN partner_nickname VARCHAR(50) NULL');
+        console.log('✅ Added partner_nickname to users');
+    } catch { }
+    try {
+        await dbPromise.query('ALTER TABLE users ADD COLUMN chat_wallpaper VARCHAR(255) NULL');
+        console.log('✅ Added chat_wallpaper to users');
+    } catch { }
+}
+
+async function ensureMessageFeatureColumns() {
+    try {
+        await dbPromise.query('ALTER TABLE messages ADD COLUMN reply_to_message_id INT NULL');
+        console.log('✅ Added reply_to_message_id to messages');
+    } catch { }
+    try {
+        await dbPromise.query('ALTER TABLE messages ADD COLUMN deleted_at TIMESTAMP NULL');
+        console.log('✅ Added deleted_at to messages');
+    } catch { }
+}
+
 async function initializeDatabase() {
     await dbPromise.query('SELECT 1');
     await ensurePinColumnSupportsHashes();
     await ensureUserPresenceColumn();
+    await ensurePersonalizationColumns();
     await ensureMessageFeatureColumns();
     console.log('✅ Successfully connected to TiDB/MySQL using pooled connections.');
 }
@@ -406,7 +443,7 @@ app.post('/login', authLimiter, async (req, res) => {
         // Fetch only users — kept small deliberately (couples app, 2-5 users max).
         // We must check all because PINs are bcrypt-hashed (can't query by plain value).
         const [results] = await dbPromise.query(
-            'SELECT id, name, pin_code, profile_pic FROM users LIMIT 20'
+            'SELECT id, name, pin_code, profile_pic, partner_nickname, chat_wallpaper FROM users LIMIT 20'
         );
 
         let matchedUser = null;
@@ -451,7 +488,9 @@ app.post('/login', authLimiter, async (req, res) => {
             user: {
                 id: matchedUser.id,
                 name: matchedUser.name,
-                profile_pic: matchedUser.profile_pic
+                profile_pic: matchedUser.profile_pic,
+                partner_nickname: matchedUser.partner_nickname,
+                chat_wallpaper: matchedUser.chat_wallpaper
             }
         });
     } catch (err) {
@@ -519,6 +558,48 @@ app.post('/change-password', requireAuth, async (req, res) => {
     });
 });
 
+app.post('/profile-pic/upload', requireAuth, uploadLimiter, upload.single('profile_pic'), async (req, res) => {
+    const userId = req.user.userId;
+    if (!req.file) {
+        return res.status(400).json({ success: false, message: 'No file uploaded' });
+    }
+    const publicFilePath = `/uploads/profiles/${req.file.filename}`;
+
+    try {
+        await dbPromise.query('UPDATE users SET profile_pic = ? WHERE id = ?', [publicFilePath, userId]);
+        return res.json({ success: true, profile_pic: publicFilePath });
+    } catch (err) {
+        console.error('Database error updating profile_pic:', err);
+        return res.status(500).json({ success: false, message: 'Failed to upload image' });
+    }
+});
+
+// POST /settings/personalization - Set wallpaper & nickname
+app.post('/settings/personalization', requireAuth, uploadLimiter, upload.single('chat_wallpaper'), async (req, res) => {
+    const userId = req.user.userId;
+    const partnerNickname = req.body.partner_nickname || null;
+    let wallpaperPath = req.body.chat_wallpaper || null; // for resetting to default if empty
+
+    if (req.file) {
+        wallpaperPath = `/uploads/profiles/${req.file.filename}`;
+    }
+
+    try {
+        if (wallpaperPath !== undefined && partnerNickname !== undefined) {
+             await dbPromise.query('UPDATE users SET chat_wallpaper = ?, partner_nickname = ? WHERE id = ?', [wallpaperPath, partnerNickname, userId]);
+        } else if (wallpaperPath !== undefined) {
+             await dbPromise.query('UPDATE users SET chat_wallpaper = ? WHERE id = ?', [wallpaperPath, userId]);
+        } else if (partnerNickname !== undefined) {
+             await dbPromise.query('UPDATE users SET partner_nickname = ? WHERE id = ?', [partnerNickname, userId]);
+        }
+        
+        return res.json({ success: true, chat_wallpaper: wallpaperPath, partner_nickname: partnerNickname });
+    } catch (err) {
+        console.error('Database error updating personalization:', err);
+        return res.status(500).json({ success: false, message: 'Failed to save personalization' });
+    }
+});
+
 app.post('/profile/picture', requireAuth, profileUpload.single('avatar'), (req, res) => {
     const userId = req.user.userId;
 
@@ -542,22 +623,16 @@ app.post('/profile/picture', requireAuth, profileUpload.single('avatar'), (req, 
     });
 });
 
-app.get('/users/profiles', requireAuth, (_, res) => {
-    db.query(
-        `SELECT id, name, profile_pic, last_seen_at,
-                CASE
-                    WHEN last_seen_at IS NOT NULL AND last_seen_at >= (NOW() - INTERVAL 45 SECOND) THEN 1
-                    ELSE 0
-                END AS is_online
-         FROM users
-         ORDER BY id ASC`,
-        (err, results) => {
-        if (err) {
-            console.error('Database error:', err);
-            return res.status(500).json({ success: false, message: 'Failed to fetch user profiles' });
-        }
-        res.json({ success: true, users: results });
-    });
+app.get('/users/profiles', requireAuth, async (req, res) => {
+    try {
+        const [rows] = await dbPromise.query(
+            'SELECT id, name, profile_pic, last_seen_at, partner_nickname, chat_wallpaper, CASE WHEN last_seen_at IS NOT NULL AND last_seen_at >= (NOW() - INTERVAL 45 SECOND) THEN 1 ELSE 0 END AS is_online FROM users'
+        );
+        return res.json({ success: true, users: rows });
+    } catch (err) {
+        console.error('Database error:', err);
+        return res.status(500).json({ success: false, message: 'Server error fetching profiles' });
+    }
 });
 
 app.post('/presence/heartbeat', requireAuth, async (req, res) => {
@@ -631,6 +706,51 @@ app.post('/messages', requireAuth, messageLimiter, async (req, res) => {
     } catch (err) {
         console.error('Database error:', err);
         return res.status(500).json({ success: false, message: 'Failed to save message' });
+    }
+});
+
+// POST /messages/voice - Upload voice memo and send as [VOICE] payload message
+app.post('/messages/voice', requireAuth, messageLimiter, upload.single('audio'), async (req, res) => {
+    const senderId = req.user.userId;
+    const replyTo = req.body.replyTo ? Number(req.body.replyTo) : null;
+    
+    if (!req.file) {
+        return res.status(400).json({ success: false, message: 'No audio file uploaded' });
+    }
+
+    const durationMs = req.body.durationMs ? Number(req.body.durationMs) : 0;
+    const filePath = `/uploads/vault/${req.file.filename}`;
+    
+    const payload = JSON.stringify({
+        text: '',
+        attachments: [
+            {
+                type: 'voice',
+                uri: filePath,
+                durationMs: durationMs
+            }
+        ]
+    });
+    const messageContent = `[MEDIA_PAYLOAD]${payload}`;
+
+    try {
+        const schema = await resolveMessageSchema();
+        let query, params;
+
+        if (schema.replyColumn) {
+            query = `INSERT INTO messages (${schema.senderColumn}, ${schema.textColumn}, ${schema.replyColumn}) VALUES (?, ?, ?)`;
+            params = [senderId, messageContent, replyTo];
+        } else {
+            query = `INSERT INTO messages (${schema.senderColumn}, ${schema.textColumn}) VALUES (?, ?)`;
+            params = [senderId, messageContent];
+        }
+
+        const [result] = await dbPromise.query(query, params);
+        io.emit('new-message', { id: result.insertId }); // Broadcast natively
+        return res.json({ success: true, messageId: result.insertId });
+    } catch (err) {
+        console.error('Save voice msg error:', err);
+        return res.status(500).json({ success: false, message: 'Database error saving voice message' });
     }
 });
 
@@ -998,7 +1118,43 @@ const PORT = getNumberEnv('PORT', 10000);
 async function startServer() {
     try {
         await initializeDatabase();
-        app.listen(PORT, () => {
+        app.use((req, res) => res.status(404).json({ success: false, message: 'Not Found' }));
+
+        // Socket.IO Setup
+        const io = new Server(httpServer, {
+            cors: { origin: '*', methods: ['GET', 'POST'] },
+            pingTimeout: 60000,
+        });
+
+        // Make io global for route emit access (if needed, though standard events are mostly handled inside socket)
+        global.io = io;
+
+        io.use((socket, next) => {
+            const token = socket.handshake.auth.token || socket.handshake.query.token;
+            if (!token) return next(new Error('Authentication error'));
+            try {
+                const decoded = jwt.verify(token, JWT_SECRET);
+                socket.user = decoded;
+                next();
+            } catch (err) {
+                next(new Error('Authentication error'));
+            }
+        });
+
+        io.on('connection', (socket) => {
+            const userId = socket.user.userId;
+            socket.join(`user_${userId}`);
+            
+            socket.on('typing', (isTyping) => {
+                socket.broadcast.emit('typing', { userId, isTyping });
+            });
+
+            socket.on('disconnect', () => {
+                // Not broadcasting immediate offline since they might just be refreshing
+            });
+        });
+
+        httpServer.listen(PORT, () => {
             console.log(`🚀 Server is running on port ${PORT}`);
             if (RENDER_EXTERNAL_URL) {
                 console.log(`🌐 Public URL: ${RENDER_EXTERNAL_URL}`);
@@ -1006,7 +1162,7 @@ async function startServer() {
             startInternalHeartbeat();
         });
     } catch (error) {
-        console.error('❌ Server startup failed:', error.message);
+        console.error('❌ Server startup failed:', error);
         process.exit(1);
     }
 }
