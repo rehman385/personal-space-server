@@ -23,6 +23,7 @@ db.connect((err) => {
             name VARCHAR(50) NOT NULL,
             pin_code VARCHAR(255) NOT NULL,
             profile_pic VARCHAR(255) DEFAULT NULL,
+            last_seen_at DATETIME DEFAULT NULL,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     `;
@@ -33,6 +34,9 @@ db.connect((err) => {
             id INT AUTO_INCREMENT PRIMARY KEY,
             sender_id INT NOT NULL,
             text TEXT NOT NULL,
+            reply_to_message_id BIGINT DEFAULT NULL,
+            seen_at DATETIME DEFAULT NULL,
+            deleted_at DATETIME DEFAULT NULL,
             sent_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (sender_id) REFERENCES users(id)
         )
@@ -92,11 +96,25 @@ db.connect((err) => {
                         if (err) throw err;
                         console.log('✅ "nudges" table is ready.');
 
-                        console.log('🎉 All feature tables are ready! Exiting setup.');
-                        process.exit(); // Closes the script automatically
-                    });
-                });
-            });
-        });
+                        db.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS last_seen_at DATETIME NULL', (err) => {
+                            if (err && err.code !== 'ER_DUP_FIELDNAME') throw err;
+
+                            db.query('ALTER TABLE messages ADD COLUMN IF NOT EXISTS reply_to_message_id BIGINT NULL', (err) => {
+                                if (err && err.code !== 'ER_DUP_FIELDNAME') throw err;
+
+                                db.query('ALTER TABLE messages ADD COLUMN IF NOT EXISTS seen_at DATETIME NULL', (err) => {
+                                    if (err && err.code !== 'ER_DUP_FIELDNAME') throw err;
+
+                                    db.query('ALTER TABLE messages ADD COLUMN IF NOT EXISTS deleted_at DATETIME NULL', (err) => {
+                                        if (err && err.code !== 'ER_DUP_FIELDNAME') throw err;
+
+                                        console.log('✅ Chat presence and receipt columns are ready.');
+
+                                        console.log('🎉 All feature tables are ready! Exiting setup.');
+                                        process.exit(); // Closes the script automatically
+                                    });
+                                });
+                            });
+                        });
     });
 });

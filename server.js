@@ -204,6 +204,8 @@ async function pinColumnSupportsHashes() {
 async function initializeDatabase() {
     await dbPromise.query('SELECT 1');
     await ensurePinColumnSupportsHashes();
+    await ensureUserPresenceColumn();
+    await ensureMessageFeatureColumns();
     console.log('✅ Successfully connected to TiDB/MySQL using pooled connections.');
 }
 
@@ -240,6 +242,7 @@ function startInternalHeartbeat() {
 }
 
 let messageSchemaCache = null;
+let userPresenceSchemaChecked = false;
 
 async function resolveMessageSchema() {
     if (messageSchemaCache) {
@@ -257,6 +260,9 @@ async function resolveMessageSchema() {
     const senderColumn = columns.has('sender_id') ? 'sender_id' : (columns.has('sender') ? 'sender' : null);
     const textColumn = columns.has('text') ? 'text' : (columns.has('message') ? 'message' : null);
     const timestampColumn = columns.has('sent_at') ? 'sent_at' : (columns.has('created_at') ? 'created_at' : null);
+    const replyColumn = columns.has('reply_to_message_id') ? 'reply_to_message_id' : null;
+    const seenColumn = columns.has('seen_at') ? 'seen_at' : null;
+    const deletedColumn = columns.has('deleted_at') ? 'deleted_at' : null;
 
     if (!senderColumn) {
         throw new Error('messages table is missing a sender/sender_id column');
@@ -266,8 +272,76 @@ async function resolveMessageSchema() {
         throw new Error('messages table is missing a text/message column');
     }
 
-    messageSchemaCache = { senderColumn, textColumn, timestampColumn };
+    messageSchemaCache = { senderColumn, textColumn, timestampColumn, replyColumn, seenColumn, deletedColumn };
     return messageSchemaCache;
+}
+
+async function ensureMessageFeatureColumns() {
+    const [rows] = await dbPromise.query(
+        `SELECT COLUMN_NAME
+         FROM INFORMATION_SCHEMA.COLUMNS
+         WHERE TABLE_SCHEMA = DATABASE()
+           AND TABLE_NAME = 'messages'`
+    );
+
+    const columns = new Set(rows.map((row) => row.COLUMN_NAME));
+    const alters = [];
+
+    if (!columns.has('reply_to_message_id')) {
+        alters.push('ADD COLUMN reply_to_message_id BIGINT NULL');
+    }
+
+    if (!columns.has('seen_at')) {
+        alters.push('ADD COLUMN seen_at DATETIME NULL');
+    }
+
+    if (!columns.has('deleted_at')) {
+        alters.push('ADD COLUMN deleted_at DATETIME NULL');
+    }
+
+    if (alters.length > 0) {
+        try {
+            await dbPromise.query(`ALTER TABLE messages ${alters.join(', ')}`);
+            messageSchemaCache = null;
+            console.log('✅ Added missing chat message feature columns.');
+        } catch (error) {
+            console.warn('⚠️ Could not auto-add all message feature columns:', error.message);
+        }
+    }
+}
+
+async function ensureUserPresenceColumn() {
+    if (userPresenceSchemaChecked) {
+        return;
+    }
+
+    const [rows] = await dbPromise.query(
+        `SELECT COLUMN_NAME
+         FROM INFORMATION_SCHEMA.COLUMNS
+         WHERE TABLE_SCHEMA = DATABASE()
+           AND TABLE_NAME = 'users'
+           AND COLUMN_NAME = 'last_seen_at'`
+    );
+
+    if (!rows.length) {
+        try {
+            await dbPromise.query('ALTER TABLE users ADD COLUMN last_seen_at DATETIME NULL');
+            console.log('✅ Added users.last_seen_at for presence tracking.');
+        } catch (error) {
+            console.warn('⚠️ Could not add users.last_seen_at:', error.message);
+        }
+    }
+
+    userPresenceSchemaChecked = true;
+}
+
+async function touchUserPresence(userId) {
+    try {
+        await ensureUserPresenceColumn();
+        await dbPromise.query('UPDATE users SET last_seen_at = NOW() WHERE id = ?', [userId]);
+    } catch (error) {
+        console.warn('⚠️ Presence update skipped:', error.message);
+    }
 }
 
 // ==================== AUTHENTICATION ====================
@@ -326,6 +400,8 @@ app.post('/login', authLimiter, (req, res) => {
                 console.error('PIN hash capability check failed:', migrationErr.message);
             }
         }
+
+        await touchUserPresence(matchedUser.id);
 
         const token = createToken(matchedUser);
 
@@ -424,7 +500,15 @@ app.post('/profile/picture', requireAuth, profileUpload.single('avatar'), (req, 
 });
 
 app.get('/users/profiles', requireAuth, (_, res) => {
-    db.query('SELECT id, name, profile_pic FROM users ORDER BY id ASC', (err, results) => {
+    db.query(
+        `SELECT id, name, profile_pic, last_seen_at,
+                CASE
+                    WHEN last_seen_at IS NOT NULL AND last_seen_at >= (NOW() - INTERVAL 45 SECOND) THEN 1
+                    ELSE 0
+                END AS is_online
+         FROM users
+         ORDER BY id ASC`,
+        (err, results) => {
         if (err) {
             console.error('Database error:', err);
             return res.status(500).json({ success: false, message: 'Failed to fetch user profiles' });
@@ -433,11 +517,39 @@ app.get('/users/profiles', requireAuth, (_, res) => {
     });
 });
 
+app.post('/presence/heartbeat', requireAuth, async (req, res) => {
+    await touchUserPresence(req.user.userId);
+    res.json({ success: true, status: 'ok' });
+});
+
+app.post('/messages/mark-seen', requireAuth, async (req, res) => {
+    try {
+        const { senderColumn, seenColumn } = await resolveMessageSchema();
+
+        if (!seenColumn) {
+            return res.json({ success: true, updated: 0 });
+        }
+
+        const [result] = await dbPromise.query(
+            `UPDATE messages
+             SET ${seenColumn} = NOW()
+             WHERE CAST(${senderColumn} AS UNSIGNED) <> ?
+               AND ${seenColumn} IS NULL`,
+            [req.user.userId]
+        );
+
+        res.json({ success: true, updated: result.affectedRows || 0 });
+    } catch (err) {
+        console.error('Database error:', err);
+        return res.status(500).json({ success: false, message: 'Failed to mark messages as seen' });
+    }
+});
+
 // ==================== CHAT MESSAGES ====================
 
 // POST /messages - Save a message to the database
 app.post('/messages', requireAuth, async (req, res) => {
-    const { text } = req.body;
+    const { text, reply_to_message_id } = req.body;
     const sender_id = req.user.userId;
 
     if (!text || !String(text).trim()) {
@@ -445,10 +557,18 @@ app.post('/messages', requireAuth, async (req, res) => {
     }
 
     try {
-        const { senderColumn, textColumn } = await resolveMessageSchema();
+        const { senderColumn, textColumn, replyColumn } = await resolveMessageSchema();
+        const columns = [senderColumn, textColumn];
+        const values = [String(sender_id), String(text).trim()];
+
+        if (replyColumn) {
+            columns.push(replyColumn);
+            values.push(reply_to_message_id ? Number(reply_to_message_id) : null);
+        }
+
         const [result] = await dbPromise.query(
-            `INSERT INTO messages (${senderColumn}, ${textColumn}) VALUES (?, ?)`,
-            [String(sender_id), String(text).trim()]
+            `INSERT INTO messages (${columns.join(', ')}) VALUES (${columns.map(() => '?').join(', ')})`,
+            values
         );
 
         res.json({
@@ -457,6 +577,7 @@ app.post('/messages', requireAuth, async (req, res) => {
                 id: result.insertId,
                 sender_id,
                 text: String(text).trim(),
+                reply_to_message_id: reply_to_message_id ? Number(reply_to_message_id) : null,
                 sent_at: new Date()
             }
         });
@@ -469,23 +590,74 @@ app.post('/messages', requireAuth, async (req, res) => {
 // GET /messages - Fetch all chat history
 app.get('/messages', requireAuth, async (req, res) => {
     try {
-        const { senderColumn, textColumn, timestampColumn } = await resolveMessageSchema();
+        await touchUserPresence(req.user.userId);
+
+        const { senderColumn, textColumn, timestampColumn, replyColumn, seenColumn, deletedColumn } = await resolveMessageSchema();
         const orderColumn = timestampColumn || 'id';
-        const selectTimestamp = timestampColumn ? `${timestampColumn} AS sent_at` : 'NOW() AS sent_at';
+        const selectTimestamp = timestampColumn ? `m.${timestampColumn} AS sent_at` : 'NOW() AS sent_at';
         const selectSender = senderColumn === 'sender_id'
-            ? 'sender_id'
-            : `CAST(${senderColumn} AS UNSIGNED) AS sender_id`;
+            ? 'm.sender_id'
+            : `CAST(m.${senderColumn} AS UNSIGNED) AS sender_id`;
+
+          const replySelects = replyColumn
+                ? `, m.${replyColumn} AS reply_to_message_id,
+                    ${seenColumn ? `m.${seenColumn} AS seen_at` : 'NULL AS seen_at'},
+                    ${deletedColumn ? `m.${deletedColumn} AS deleted_at` : 'NULL AS deleted_at'},
+                    parent.${textColumn} AS reply_text,
+                    CASE WHEN parent.id IS NULL THEN NULL ELSE CAST(parent.${senderColumn} AS UNSIGNED) END AS reply_sender_id,
+                    ${deletedColumn ? 'parent.deleted_at AS reply_deleted_at' : 'NULL AS reply_deleted_at'}`
+                : `, NULL AS reply_to_message_id, NULL AS seen_at, NULL AS deleted_at, NULL AS reply_text, NULL AS reply_sender_id, NULL AS reply_deleted_at`;
+
+        if (seenColumn) {
+            await dbPromise.query(
+                `UPDATE messages
+                 SET ${seenColumn} = NOW()
+                 WHERE CAST(${senderColumn} AS UNSIGNED) <> ?
+                   AND ${seenColumn} IS NULL`,
+                [req.user.userId]
+            );
+        }
 
         const [results] = await dbPromise.query(
-            `SELECT id, ${selectSender}, ${textColumn} AS text, ${selectTimestamp}
-             FROM messages
-             ORDER BY ${orderColumn} ASC`
+            `SELECT m.id,
+                    ${selectSender},
+                    CASE WHEN ${deletedColumn ? `m.${deletedColumn} IS NULL` : '1=1'} THEN m.${textColumn} ELSE NULL END AS text,
+                    ${selectTimestamp}${replySelects}
+             FROM messages m
+             LEFT JOIN messages parent ON ${replyColumn ? `parent.id = m.${replyColumn}` : '1 = 0'}
+             ORDER BY m.${orderColumn} ASC`
         );
 
         res.json({ success: true, messages: results });
     } catch (err) {
         console.error('Database error:', err);
         return res.status(500).json({ success: false, message: 'Failed to fetch messages' });
+    }
+});
+
+// POST /messages/clear - Clear all chat history (requires explicit confirmation)
+app.post('/messages/clear', requireAuth, async (req, res) => {
+    const { confirm } = req.body || {};
+
+    if (confirm !== 'DELETE_ALL_MESSAGES') {
+        return res.status(400).json({
+            success: false,
+            message: 'Confirmation token is required to clear chat history.'
+        });
+    }
+
+    try {
+        const [result] = await dbPromise.query('DELETE FROM messages');
+        await touchUserPresence(req.user.userId);
+
+        res.json({
+            success: true,
+            deleted: result.affectedRows || 0,
+            message: 'All chat messages deleted.'
+        });
+    } catch (err) {
+        console.error('Database error:', err);
+        return res.status(500).json({ success: false, message: 'Failed to clear messages' });
     }
 });
 
