@@ -13,6 +13,7 @@ const tls = require('tls');
 const axios = require('axios');
 
 const app = express();
+app.set('trust proxy', 1);
 const JWT_SECRET = process.env.JWT_SECRET || 'replace_this_with_a_long_secret_key';
 const RENDER_EXTERNAL_URL = process.env.RENDER_EXTERNAL_URL || null;
 const HEARTBEAT_INTERVAL_MS = 14 * 60 * 1000;
