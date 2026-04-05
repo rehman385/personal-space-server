@@ -19,9 +19,25 @@ const RENDER_EXTERNAL_URL = process.env.RENDER_EXTERNAL_URL || null;
 const HEARTBEAT_INTERVAL_MS = 14 * 60 * 1000;
 
 // Middleware (Security and formatting)
-app.use(cors());
+const ALLOWED_ORIGINS = [
+    process.env.ALLOWED_ORIGIN,
+    'https://personal-space-backend-w8aq.onrender.com',
+    'http://localhost:8081',
+    'http://localhost:19006',
+].filter(Boolean);
+
+app.use(cors({
+    origin: (origin, callback) => {
+        // Allow requests with no origin (mobile apps, curl, etc.)
+        if (!origin) return callback(null, true);
+        if (ALLOWED_ORIGINS.includes(origin)) return callback(null, true);
+        callback(null, true); // Still permissive for Expo — tighten if needed
+    },
+    methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization'],
+}));
 app.use(helmet());
-app.use(express.json()); // Allows your server to read incoming JSON data from the app
+app.use(express.json({ limit: '10mb' })); // Allows your server to read incoming JSON data from the app
 
 const uploadDir = path.join(__dirname, 'uploads', 'vault');
 const profileUploadDir = path.join(__dirname, 'uploads', 'profiles');
@@ -32,7 +48,11 @@ if (!fs.existsSync(profileUploadDir)) {
     fs.mkdirSync(profileUploadDir, { recursive: true });
 }
 
-app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
+app.use('/uploads', (req, res, next) => {
+    // Cache uploaded media for 7 days in browser/CDN, 1 day private
+    res.setHeader('Cache-Control', 'public, max-age=86400, s-maxage=604800');
+    next();
+}, express.static(path.join(__dirname, 'uploads')));
 
 const storage = multer.diskStorage({
     destination: (_, __, cb) => cb(null, uploadDir),
@@ -74,6 +94,30 @@ const authLimiter = rateLimit({
     standardHeaders: true,
     legacyHeaders: false,
     message: { success: false, message: 'Too many login attempts. Try again later.' }
+});
+
+const messageLimiter = rateLimit({
+    windowMs: 60 * 1000,
+    max: 60,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { success: false, message: 'Too many messages. Please slow down.' }
+});
+
+const uploadLimiter = rateLimit({
+    windowMs: 60 * 1000,
+    max: 15,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { success: false, message: 'Too many uploads. Please wait a moment.' }
+});
+
+const nudgeLimiter = rateLimit({
+    windowMs: 60 * 1000,
+    max: 30,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { success: false, message: 'Too many nudges. Please slow down.' }
 });
 
 function createToken(user) {
@@ -347,7 +391,7 @@ async function touchUserPresence(userId) {
 // ==================== AUTHENTICATION ====================
 
 // POST /login - Verify PIN and return user data
-app.post('/login', authLimiter, (req, res) => {
+app.post('/login', authLimiter, async (req, res) => {
     const { pin_code } = req.body;
 
     if (!pin_code) {
@@ -358,12 +402,12 @@ app.post('/login', authLimiter, (req, res) => {
         return res.status(400).json({ success: false, message: 'PIN must be exactly 4 digits' });
     }
 
-    // Query all users and verify pin (supports both plain and hashed pin_code)
-    db.query('SELECT id, name, pin_code, profile_pic FROM users', async (err, results) => {
-        if (err) {
-            console.error('Database error:', err);
-            return res.status(500).json({ success: false, message: 'Server error' });
-        }
+    try {
+        // Fetch only users — kept small deliberately (couples app, 2-5 users max).
+        // We must check all because PINs are bcrypt-hashed (can't query by plain value).
+        const [results] = await dbPromise.query(
+            'SELECT id, name, pin_code, profile_pic FROM users LIMIT 20'
+        );
 
         let matchedUser = null;
 
@@ -390,14 +434,10 @@ app.post('/login', authLimiter, (req, res) => {
             try {
                 if (await pinColumnSupportsHashes()) {
                     const hashed = await bcrypt.hash(pin_code, 12);
-                    db.query('UPDATE users SET pin_code = ? WHERE id = ?', [hashed, matchedUser.id], (updateErr) => {
-                        if (updateErr) {
-                            console.error('PIN hash migration skipped:', updateErr.message);
-                        }
-                    });
+                    await dbPromise.query('UPDATE users SET pin_code = ? WHERE id = ?', [hashed, matchedUser.id]);
                 }
             } catch (migrationErr) {
-                console.error('PIN hash capability check failed:', migrationErr.message);
+                console.error('PIN hash migration skipped:', migrationErr.message);
             }
         }
 
@@ -405,7 +445,7 @@ app.post('/login', authLimiter, (req, res) => {
 
         const token = createToken(matchedUser);
 
-        res.json({
+        return res.json({
             success: true,
             token,
             user: {
@@ -414,7 +454,10 @@ app.post('/login', authLimiter, (req, res) => {
                 profile_pic: matchedUser.profile_pic
             }
         });
-    });
+    } catch (err) {
+        console.error('Login error:', err);
+        return res.status(500).json({ success: false, message: 'Server error' });
+    }
 });
 
 // POST /change-password - Change PIN/Password
@@ -548,12 +591,16 @@ app.post('/messages/mark-seen', requireAuth, async (req, res) => {
 // ==================== CHAT MESSAGES ====================
 
 // POST /messages - Save a message to the database
-app.post('/messages', requireAuth, async (req, res) => {
+app.post('/messages', requireAuth, messageLimiter, async (req, res) => {
     const { text, reply_to_message_id } = req.body;
     const sender_id = req.user.userId;
 
     if (!text || !String(text).trim()) {
         return res.status(400).json({ success: false, message: 'text is required' });
+    }
+
+    if (String(text).trim().length > 5000) {
+        return res.status(400).json({ success: false, message: 'Message too long (max 5000 characters)' });
     }
 
     try {
@@ -571,7 +618,7 @@ app.post('/messages', requireAuth, async (req, res) => {
             values
         );
 
-        res.json({
+        return res.json({
             success: true,
             message: {
                 id: result.insertId,
@@ -635,6 +682,80 @@ app.get('/messages', requireAuth, async (req, res) => {
     }
 });
 
+// DELETE /messages/:id - Soft-delete (unsend) a specific message
+app.delete('/messages/:id', requireAuth, async (req, res) => {
+    const messageId = Number(req.params.id);
+    const userId = req.user.userId;
+
+    if (!Number.isFinite(messageId)) {
+        return res.status(400).json({ success: false, message: 'Invalid message id' });
+    }
+
+    try {
+        const { senderColumn, deletedColumn } = await resolveMessageSchema();
+
+        if (!deletedColumn) {
+            return res.status(404).json({ success: false, message: 'Unsend feature not available' });
+        }
+
+        const [rows] = await dbPromise.query(
+            `SELECT id FROM messages WHERE id = ? AND CAST(${senderColumn} AS UNSIGNED) = ? AND ${deletedColumn} IS NULL`,
+            [messageId, userId]
+        );
+
+        if (!rows.length) {
+            return res.status(404).json({ success: false, message: 'Message not found or already unsent' });
+        }
+
+        await dbPromise.query(
+            `UPDATE messages SET ${deletedColumn} = NOW() WHERE id = ?`,
+            [messageId]
+        );
+
+        return res.json({ success: true, message: 'Message unsent' });
+    } catch (err) {
+        console.error('Database error:', err);
+        return res.status(500).json({ success: false, message: 'Failed to unsend message' });
+    }
+});
+
+// POST /messages/:id/unsend - Alias for DELETE (for clients that can't send DELETE)
+app.post('/messages/:id/unsend', requireAuth, async (req, res) => {
+    const messageId = Number(req.params.id);
+    const userId = req.user.userId;
+
+    if (!Number.isFinite(messageId)) {
+        return res.status(400).json({ success: false, message: 'Invalid message id' });
+    }
+
+    try {
+        const { senderColumn, deletedColumn } = await resolveMessageSchema();
+
+        if (!deletedColumn) {
+            return res.status(404).json({ success: false, message: 'Unsend feature not available' });
+        }
+
+        const [rows] = await dbPromise.query(
+            `SELECT id FROM messages WHERE id = ? AND CAST(${senderColumn} AS UNSIGNED) = ? AND ${deletedColumn} IS NULL`,
+            [messageId, userId]
+        );
+
+        if (!rows.length) {
+            return res.status(404).json({ success: false, message: 'Message not found or already unsent' });
+        }
+
+        await dbPromise.query(
+            `UPDATE messages SET ${deletedColumn} = NOW() WHERE id = ?`,
+            [messageId]
+        );
+
+        return res.json({ success: true, message: 'Message unsent' });
+    } catch (err) {
+        console.error('Database error:', err);
+        return res.status(500).json({ success: false, message: 'Failed to unsend message' });
+    }
+});
+
 // POST /messages/clear - Clear all chat history (requires explicit confirmation)
 app.post('/messages/clear', requireAuth, async (req, res) => {
     const { confirm } = req.body || {};
@@ -664,7 +785,7 @@ app.post('/messages/clear', requireAuth, async (req, res) => {
 // ==================== VAULT (FILE UPLOADS) ====================
 
 // POST /vault/upload - Upload image/video to private vault
-app.post('/vault/upload', requireAuth, upload.single('media'), (req, res) => {
+app.post('/vault/upload', requireAuth, uploadLimiter, upload.single('media'), async (req, res) => {
     const userId = req.user.userId;
     const caption = (req.body.caption || '').toString().trim();
 
@@ -675,85 +796,77 @@ app.post('/vault/upload', requireAuth, upload.single('media'), (req, res) => {
     const mediaType = req.file.mimetype.startsWith('video/') ? 'video' : 'image';
     const filePath = `/uploads/vault/${req.file.filename}`;
 
-    db.query(
-        'INSERT INTO vault_items (user_id, media_type, file_path, caption) VALUES (?, ?, ?, ?)',
-        [userId, mediaType, filePath, caption],
-        (err, result) => {
-            if (err) {
-                console.error('Database error:', err);
-                return res.status(500).json({ success: false, message: 'Failed to save media item' });
-            }
+    try {
+        const [result] = await dbPromise.query(
+            'INSERT INTO vault_items (user_id, media_type, file_path, caption) VALUES (?, ?, ?, ?)',
+            [userId, mediaType, filePath, caption]
+        );
 
-            res.json({
-                success: true,
-                item: {
-                    id: result.insertId,
-                    user_id: userId,
-                    media_type: mediaType,
-                    file_path: filePath,
-                    caption,
-                    created_at: new Date()
-                }
-            });
-        }
-    );
+        return res.json({
+            success: true,
+            item: {
+                id: result.insertId,
+                user_id: userId,
+                media_type: mediaType,
+                file_path: filePath,
+                caption,
+                created_at: new Date()
+            }
+        });
+    } catch (err) {
+        console.error('Database error:', err);
+        return res.status(500).json({ success: false, message: 'Failed to save media item' });
+    }
 });
 
 // GET /vault - Fetch vault media history
-app.get('/vault', requireAuth, (_, res) => {
-    db.query('SELECT * FROM vault_items ORDER BY created_at DESC', (err, results) => {
-        if (err) {
-            console.error('Database error:', err);
-            return res.status(500).json({ success: false, message: 'Failed to fetch vault items' });
-        }
-
-        res.json({ success: true, items: results });
-    });
+app.get('/vault', requireAuth, async (_, res) => {
+    try {
+        const [results] = await dbPromise.query('SELECT * FROM vault_items ORDER BY created_at DESC');
+        return res.json({ success: true, items: results });
+    } catch (err) {
+        console.error('Database error:', err);
+        return res.status(500).json({ success: false, message: 'Failed to fetch vault items' });
+    }
 });
 
 // DELETE /vault/:id - Delete own vault item
-app.delete('/vault/:id', requireAuth, (req, res) => {
+app.delete('/vault/:id', requireAuth, async (req, res) => {
     const itemId = Number(req.params.id);
     const userId = req.user.userId;
 
-    db.query('SELECT * FROM vault_items WHERE id = ? AND user_id = ?', [itemId, userId], (err, rows) => {
-        if (err) {
-            console.error('Database error:', err);
-            return res.status(500).json({ success: false, message: 'Failed to verify item' });
-        }
+    try {
+        const [rows] = await dbPromise.query(
+            'SELECT * FROM vault_items WHERE id = ? AND user_id = ?',
+            [itemId, userId]
+        );
         if (!rows.length) {
             return res.status(404).json({ success: false, message: 'Item not found' });
         }
 
         const fullPath = path.join(__dirname, rows[0].file_path.replace(/^\//, ''));
-        db.query('DELETE FROM vault_items WHERE id = ?', [itemId], (deleteErr) => {
-            if (deleteErr) {
-                console.error('Database error:', deleteErr);
-                return res.status(500).json({ success: false, message: 'Failed to delete item' });
-            }
-
-            fs.unlink(fullPath, () => {
-                // Ignore file delete errors if file already missing.
-            });
-
-            res.json({ success: true });
-        });
-    });
+        await dbPromise.query('DELETE FROM vault_items WHERE id = ?', [itemId]);
+        fs.unlink(fullPath, () => { /* Ignore if file already missing */ });
+        return res.json({ success: true });
+    } catch (err) {
+        console.error('Database error:', err);
+        return res.status(500).json({ success: false, message: 'Failed to delete item' });
+    }
 });
 
 // ==================== DATES ====================
 
-app.get('/dates', requireAuth, (_, res) => {
-    db.query('SELECT * FROM special_dates ORDER BY event_date ASC', (err, results) => {
-        if (err) {
-            console.error('Database error:', err);
-            return res.status(500).json({ success: false, message: 'Failed to fetch dates' });
-        }
-        res.json({ success: true, items: results });
-    });
+app.get('/dates', requireAuth, async (_, res) => {
+    try {
+        const [results] = await dbPromise.query('SELECT * FROM special_dates ORDER BY event_date ASC');
+        return res.json({ success: true, items: results });
+    } catch (err) {
+        console.error('Database error:', err);
+        return res.status(500).json({ success: false, message: 'Failed to fetch dates' });
+    }
 });
 
-app.post('/dates', requireAuth, (req, res) => {
+app.post('/dates', requireAuth, async (req, res) => {
     const userId = req.user.userId;
     const title = (req.body.title || '').toString().trim();
     const eventDate = (req.body.date || '').toString().trim();
@@ -762,53 +875,51 @@ app.post('/dates', requireAuth, (req, res) => {
         return res.status(400).json({ success: false, message: 'title and date are required' });
     }
 
-    db.query(
-        'INSERT INTO special_dates (user_id, title, event_date) VALUES (?, ?, ?)',
-        [userId, title, eventDate],
-        (err, result) => {
-            if (err) {
-                console.error('Database error:', err);
-                return res.status(500).json({ success: false, message: 'Failed to save date' });
-            }
-            res.json({
-                success: true,
-                item: { id: result.insertId, user_id: userId, title, date: eventDate }
-            });
-        }
-    );
+    try {
+        const [result] = await dbPromise.query(
+            'INSERT INTO special_dates (user_id, title, event_date) VALUES (?, ?, ?)',
+            [userId, title, eventDate]
+        );
+        res.json({
+            success: true,
+            item: { id: result.insertId, user_id: userId, title, date: eventDate }
+        });
+    } catch (err) {
+        console.error('Database error:', err);
+        return res.status(500).json({ success: false, message: 'Failed to save date' });
+    }
 });
 
-app.delete('/dates/:id', requireAuth, (req, res) => {
+app.delete('/dates/:id', requireAuth, async (req, res) => {
     const id = Number(req.params.id);
     const userId = req.user.userId;
-    db.query('DELETE FROM special_dates WHERE id = ? AND user_id = ?', [id, userId], (err) => {
-        if (err) {
-            console.error('Database error:', err);
-            return res.status(500).json({ success: false, message: 'Failed to delete date' });
-        }
+    try {
+        await dbPromise.query('DELETE FROM special_dates WHERE id = ? AND user_id = ?', [id, userId]);
         res.json({ success: true });
-    });
+    } catch (err) {
+        console.error('Database error:', err);
+        return res.status(500).json({ success: false, message: 'Failed to delete date' });
+    }
 });
 
 // ==================== NUDGES ====================
 
-app.get('/nudges', requireAuth, (_, res) => {
-    db.query(
-        `SELECT n.id, n.sender_id, n.text, n.created_at, u.name AS sender_name, u.profile_pic AS sender_profile_pic
-         FROM nudges n
-         JOIN users u ON n.sender_id = u.id
-         ORDER BY n.created_at DESC`,
-        (err, results) => {
-            if (err) {
-                console.error('Database error:', err);
-                return res.status(500).json({ success: false, message: 'Failed to fetch nudges' });
-            }
-            res.json({ success: true, items: results });
-        }
-    );
+app.get('/nudges', requireAuth, async (_, res) => {
+    try {
+        const [results] = await dbPromise.query(
+            `SELECT n.id, n.sender_id, n.text, n.created_at, u.name AS sender_name, u.profile_pic AS sender_profile_pic
+             FROM nudges n
+             JOIN users u ON n.sender_id = u.id
+             ORDER BY n.created_at DESC`
+        );
+        res.json({ success: true, items: results });
+    } catch (err) {
+        console.error('Database error:', err);
+        return res.status(500).json({ success: false, message: 'Failed to fetch nudges' });
+    }
 });
 
-app.post('/nudges', requireAuth, (req, res) => {
+app.post('/nudges', requireAuth, nudgeLimiter, async (req, res) => {
     const senderId = req.user.userId;
     const senderName = req.user.name;
     const text = (req.body.text || '').toString().trim();
@@ -817,43 +928,41 @@ app.post('/nudges', requireAuth, (req, res) => {
         return res.status(400).json({ success: false, message: 'text is required' });
     }
 
-    db.query('INSERT INTO nudges (sender_id, text) VALUES (?, ?)', [senderId, text], (err, result) => {
-        if (err) {
-            console.error('Database error:', err);
-            return res.status(500).json({ success: false, message: 'Failed to save nudge' });
-        }
+    if (text.length > 500) {
+        return res.status(400).json({ success: false, message: 'Nudge too long (max 500 characters)' });
+    }
 
-        db.query('SELECT profile_pic FROM users WHERE id = ?', [senderId], (profileErr, rows) => {
-            if (profileErr) {
-                console.error('Database error:', profileErr);
-                return res.status(500).json({ success: false, message: 'Failed to fetch sender profile' });
+    try {
+        const [result] = await dbPromise.query('INSERT INTO nudges (sender_id, text) VALUES (?, ?)', [senderId, text]);
+        const [rows] = await dbPromise.query('SELECT profile_pic FROM users WHERE id = ?', [senderId]);
+
+        return res.json({
+            success: true,
+            item: {
+                id: result.insertId,
+                sender_id: senderId,
+                sender_name: senderName,
+                sender_profile_pic: rows[0]?.profile_pic || null,
+                text,
+                created_at: new Date()
             }
-
-            res.json({
-                success: true,
-                item: {
-                    id: result.insertId,
-                    sender_id: senderId,
-                    sender_name: senderName,
-                    sender_profile_pic: rows[0]?.profile_pic || null,
-                    text,
-                    created_at: new Date()
-                }
-            });
         });
-    });
+    } catch (err) {
+        console.error('Database error:', err);
+        return res.status(500).json({ success: false, message: 'Failed to save nudge' });
+    }
 });
 
-app.delete('/nudges/:id', requireAuth, (req, res) => {
+app.delete('/nudges/:id', requireAuth, async (req, res) => {
     const id = Number(req.params.id);
     const senderId = req.user.userId;
-    db.query('DELETE FROM nudges WHERE id = ? AND sender_id = ?', [id, senderId], (err) => {
-        if (err) {
-            console.error('Database error:', err);
-            return res.status(500).json({ success: false, message: 'Failed to delete nudge' });
-        }
-        res.json({ success: true });
-    });
+    try {
+        await dbPromise.query('DELETE FROM nudges WHERE id = ? AND sender_id = ?', [id, senderId]);
+        return res.json({ success: true });
+    } catch (err) {
+        console.error('Database error:', err);
+        return res.status(500).json({ success: false, message: 'Failed to delete nudge' });
+    }
 });
 
 // ==================== HEALTH & ROOT ROUTES ====================
